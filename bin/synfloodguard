@@ -1,0 +1,393 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+
+use POSIX;
+use Getopt::Long;
+use Storable qw/lock_store lock_retrieve/;
+
+=head1 NAME
+
+synfloodguard - Protect against SYN-flood attacks
+
+=head1 VERSION
+
+0.01
+
+=cut
+
+our $VERSION = 0.01;
+
+use constant {              # TCP connection states as defined in the Linux
+	TCP_ESTABLISHED => 1,   #   kernel headers (net/tcp_states.h)
+	TCP_SYN_SENT    => 2,
+	TCP_SYN_RECV    => 3,
+	TCP_FIN_WAIT1   => 4,
+	TCP_FIN_WAIT2   => 5,
+	TCP_TIME_WAIT   => 6,
+	TCP_CLOSE       => 7,
+	TCP_CLOSE_WAIT  => 8,
+	TCP_LAST_ACK    => 9,
+	TCP_LISTEN      => 10,
+	TCP_CLOSING     => 11,
+	TCP_MAX_STATES  => 12
+};
+
+=head1 SYNOPSIS
+
+synfloodguard [--state=<path>] [--pid=<path>] [--tcp=<path>] [--log=<path>]
+              [--ipset=<path>] [--set=<name>] [--poll=<seconds>]
+              [--flood=<number>] [--timeout=<seconds>] [--synner=<seconds>]
+              [--daemonize] [--quite] [--verbose] [--debug]
+
+synfloodguard --stop [--pid=<path>]
+
+=cut
+
+my $state_path = "/var/local/antidos/synfloodguard-state";
+my $pid_path = "/var/local/antidos/synfloodguard-pid";
+my $tcp_path = "/proc/net/tcp";
+my $poll_interval = 30;
+my $daemonize = 0;
+my $flood_min = 10;
+my $flood_ban_timeout = 60 * 60;
+my $synner_max_time = 15 * 60;
+my $quiet = 0;
+my $verbose = 0;
+my $debug = 0;
+my $ipset_cmd = "/usr/sbin/ipset";
+my $set = "synfloodguard";
+my $log_path = '/var/log/synfloodguard.log';
+my $stop = 0;
+my $forget_factor = 0.5;
+
+GetOptions(
+	'state=s'   => \$state_path,
+	'pid=s'     => \$pid_path,
+	'tcp=s'     => \$tcp_path,
+	'poll=i'    => \$poll_interval,
+	'daemonize' => \$daemonize,
+	'flood=i'   => \$flood_min,
+	'timeout=i' => \$flood_ban_timeout,
+	'synner=i'  => \$synner_max_time,
+	'quiet'     => \$quiet,
+	'verbose'   => \$verbose,
+	'debug'     => \$debug,
+	'ipset=s'   => \$ipset_cmd,
+	'set=s'     => \$set,
+	'log=s'     => \$log_path,
+	'stop'      => \$stop,
+	'forget=f'  => \$forget_factor,
+);
+
+if ($stop)  # Try to find running instance of the program and stop it
+{
+	my $status = 0;
+	if (-f $pid_path) {
+		if (open my $pid_fh, $pid_path) {
+			my $pid = <$pid_fh>;
+			close $pid_fh;
+			if ($pid =~ m/^(\d+)/) {
+				$pid = $1;
+			} else {
+				warn "No process identifier found in file $pid_path";
+				$status = 1;
+			}
+			unless (kill 'TERM', $pid) {
+				warn "Can't send TERM to $pid";
+				$status = 1;
+			}
+		} else {
+			warn "Can't open $pid_path: $!";
+			$status = 1;
+		}
+	} else {
+		warn "$pid_path is not a file";
+		$status = 1;
+	}
+	exit $status;
+}
+
+if (-f $pid_path) {
+	die "File '$pid_path' exists. ".
+		"Another instance of the program is running?";
+}
+
+my ($log_level_error, $log_level_warning, $log_level_info,
+	$log_level_verbose, $log_level_debug) = (1..5);
+
+my $init_verb_level =
+	$debug   ? $log_level_debug :
+	$verbose ? $log_level_verbose :
+	$quiet   ? $log_level_error :
+	           $log_level_info;
+
+my $verb_level = $init_verb_level;
+
+sub log_message { my $msg_level = shift;
+	print STDERR strftime("%b %d %T", localtime), " [$$] ", @_, "\n"
+		if $msg_level <= $verb_level;
+}
+sub log_debug   { log_message $log_level_debug,   @_; }
+sub log_verbose { log_message $log_level_verbose, @_; }
+sub log_info    { log_message $log_level_info,    @_; }
+sub log_warning { log_message $log_level_warning, @_; }
+sub log_error   { log_message $log_level_error,   @_; }
+
+sub toggle_debug {
+	if ($verb_level == $log_level_debug) {
+		$verb_level = ($init_verb_level == $log_level_debug) ?
+			$log_level_info : $init_verb_level;
+		log_info "Debug is off";
+	} else {
+		$verb_level = $log_level_debug;
+		log_info "Debug is on";
+	}
+}
+
+sub reopen_log {
+	if ($log_path ne 'STDERR') {
+		close STDOUT;
+		close STDERR;
+		open STDOUT, ">>", $log_path;
+		open STDERR, ">>", $log_path;
+		STDOUT->autoflush(1);
+		STDERR->autoflush(1);
+		log_verbose "Log is open";
+	}
+}
+
+sub handle_int { my ($sig) = @_;
+	log_verbose "Terminated by $sig signal";
+	exit 0;
+}
+
+my $state = undef;
+
+my $h1_pat = qr/[0-9A-F]/;
+my $h2_pat = qr/[0-9A-F]{2}/;
+my $h4_pat = qr/[0-9A-F]{4}/;
+my $h8_pat = qr/[0-9A-F]{8}/;
+
+sub ip2s { ($_) = @_;
+	$_ = sprintf("%08X", $_);
+	unless (m/^$h8_pat$/) {
+		log_error "[ip2s] bad parameter: $_";
+		return '<no IP-address>';
+	}
+	my @ip = ();
+	unshift @ip, hex $1 while /\G(..)/gc;
+	return join ".", @ip
+}
+
+sub state_dump {
+	my @dump = ();
+
+	if (ref $state eq 'HASH') {
+
+		push @dump, "State:";
+
+		my $flooders = $state->{flooders};
+		if (ref $flooders eq 'HASH') {
+			push @dump, "  Flooders:";
+			while (my ($ip, $time) = each %$flooders) {
+				push @dump, "    ". ip2s($ip) .": ".
+					strftime("%F %T", localtime $time);
+			}
+		} else {
+			push @dump, '  $state->{flooders} is not a hash';
+		}
+
+		my $synners = $state->{synners};
+		if (ref $synners eq 'HASH') {
+			push @dump, "  Synners:";
+			while (my ($ip, $weight) = each %$synners) {
+				push @dump, "    ". ip2s($ip) .": $weight";
+			}
+		} else {
+			push @dump, '  $state->{synners} is not a hash';
+		}
+
+	} else {
+		push @dump, '$state is not a hash';
+	}
+
+	return @dump;
+}
+
+sub log_dump {
+	my $old_verb_level = $verb_level;
+	$verb_level = $log_level_info;
+
+	log_info $_ foreach state_dump;
+
+	$verb_level = $old_verb_level;
+}
+
+$SIG{$_} = \&handle_int foreach
+	qw/TERM INT QUIT ABRT PIPE ILL FPE SEGV ALRM/;
+$SIG{HUP} = \&reopen_log;
+$SIG{USR1} = \&toggle_debug;
+$SIG{USR2} = \&log_dump;
+
+sub execute {
+	my $ret = 0;
+	my $cmd = join(' ', @_);
+	log_debug "Run: $cmd";
+	system @_;
+	if ($? == -1) {
+		log_error "Failed to execute [$cmd]: $!\n";
+	} elsif ($? & 127) {
+		log_error "[$cmd] died with signal ", ($? & 127), ", ",
+			(($? & 128) ? 'with' : 'without'), " coredump";
+	} else {
+		my $exit_status = $? >> 8;
+		if ($exit_status != 0) {
+			log_error "[$cmd] exited with status $exit_status";
+		} else {
+			log_debug "[$cmd] exited normally";
+			$ret = 1;
+		}
+	}
+	return $ret;
+}
+
+close STDIN;
+open STDIN, "/dev/null";
+reopen_log;
+
+if ($daemonize) {
+	my $pid = fork;
+	if (!defined $pid) {
+		log_error "Can't daemonize";
+		exit 1;
+	} elsif ($pid) {
+		log_debug "Parent process exits";
+		exit 0;
+	}
+}
+
+log_info "Started";
+
+if (open my $pid_fh, '>', $pid_path) {
+	print $pid_fh "$$\n";
+	close $pid_fh;
+} else {
+	log_error "Can't open $pid_path: $!";
+}
+
+$state = -f $state_path ? lock_retrieve $state_path : {
+	VERSION => $VERSION,
+	flooders => {},
+	synners => {},
+};
+
+END {
+	if ($state) {
+		log_debug $_ foreach state_dump;
+		lock_store $state, $state_path;
+	}
+	unlink $pid_path if -f $pid_path;
+}
+
+while (1)
+{
+	log_debug "Next poll";
+
+	my $fh;
+	if (open $fh, $tcp_path)
+	{
+		log_debug "$tcp_path is open";
+
+		my $now = time;
+
+		my %cnt = ();
+		while (<$fh>) {
+			chomp;
+			next unless
+				m/^ +\d+: ($h8_pat):($h4_pat) ($h8_pat):($h4_pat) ($h2_pat) /;
+
+			#log_debug "'$_'";
+
+			my ($our_ip, $our_port, $ip, $port, $state) =
+				(hex $1, hex $2, hex $3, hex $4, hex $5);
+
+			my $our_ip_s = ip2s($our_ip);
+			my $ip_s = ip2s($ip);
+
+			if ($state == TCP_SYN_RECV) {
+				log_verbose
+					"Found SYN_RECV: $ip_s:$port -> $our_ip_s:$our_port";
+				$cnt{$ip}++;
+
+				if ($cnt{$ip} >= $flood_min) {
+					log_info "Flooder detected: $ip_s";
+
+					unless (exists $state->{flooders}{$ip}) {
+						if (execute($ipset_cmd, '-A', $set, $ip_s)) {
+							log_info "$ip_s added to ipset";
+						}
+					}
+					$state->{flooders}{$ip} = $now;
+				}
+			}
+		}
+		close $fh;
+
+		log_debug "$tcp_path is closed";
+
+		my $quantum = $poll_interval / $synner_max_time;
+
+		while (my ($ip, $n) = each %cnt)
+		{
+			my $ip_s = ip2s($ip);
+
+			$state->{synners}{$ip} += $quantum;
+
+			log_debug "Synner detected: $ip_s " . $state->{synners}{$ip};
+
+			if ($state->{synners}{$ip} > 1) {
+				log_info "Annoying synner (considered flooder) detected: $ip_s";
+
+				if (exists $state->{flooders}{$ip}) {
+					$state->{flooders}{$ip} = $now;
+				} elsif (execute $ipset_cmd, '-A', $set, $ip_s) {
+					$state->{flooders}{$ip} = $now;
+					log_info "$ip_s added to ipset";
+				}
+			}
+		}
+
+		while (my ($ip, $last_time) = each %{$state->{flooders}}) {
+			if ($now - $last_time > $flood_ban_timeout) {
+				if (execute($ipset_cmd, '-D', $set, ip2s($ip))) {
+					log_info ip2s($ip), " removed from ipset";
+					delete $state->{flooders}->{$ip};
+				}
+			}
+		}
+
+		while (my ($ip, $synner_weight) = each %{$state->{synners}}) {
+			my $ip_s = ip2s($ip);
+			unless ($cnt{$ip}) {
+				$synner_weight -= $quantum * $forget_factor;
+				log_debug "Synner is not detected: $ip_s $synner_weight";
+			}
+			if ($synner_weight <= 0) {
+				log_debug "$ip_s is removed from synner hash";
+				delete $state->{synners}{$ip};
+			} else {
+				$state->{synners}{$ip} = $synner_weight;
+			}
+		}
+	}
+	else { log_warning "Can't open $tcp_path: $!"; }
+
+	lock_store $state, $state_path;
+
+	sleep $poll_interval;
+}

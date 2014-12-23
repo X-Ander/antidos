@@ -1,0 +1,44 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use feature qw/say/;
+
+use FindBin qw/$Bin/;
+use File::Copy 'cp';
+use Getopt::Long;
+
+my $prefix = "/usr/local";
+my $lib_prefix = "/usr/local/lib/site_perl";
+
+GetOptions(
+	'prefix=s' => \$prefix,
+	'libprefix=s' => \$lib_prefix,
+);
+
+my @dirs = qw{ bin };
+my @files = qw{ bin/synfloodguard };
+my @lib_dirs = qw{ };
+my @lib_files = qw{ };
+
+foreach (@dirs) {
+	$_ = "$prefix/$_";
+	say "make directory $_";
+	mkdir unless -d;
+}
+
+foreach (@lib_dirs) {
+	$_ = "$lib_prefix/$_";
+	say "make directory $_";
+	mkdir unless -d;
+}
+
+foreach (@files) {
+	say "copy $Bin/$_ to $prefix/$_";
+	cp "$Bin/$_", "$prefix/$_";
+}
+
+foreach (@lib_files) {
+	say "copy $Bin/lib/$_ to $lib_prefix/$_";
+	cp "$Bin/lib/$_", "$lib_prefix/$_";
+}
