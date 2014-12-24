@@ -1,0 +1,9 @@
+synfloodguard - Protect against SYN-flood attacks
+
+	The program reads /proc/net/tcp periodically searching the half-opened
+	connections (SYN_RECV). If there are too many such connections from
+	some IP address, that address is blacklisted for some time. Blacklisting
+	is done by run the 'ipset' command. You need to configure your firewall
+	with a rule like:
+
+	 # iptables -I INPUT 1 -m set --match-set <set name> src -j DROP

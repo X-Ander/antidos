@@ -2,9 +2,7 @@
 
 use strict;
 use warnings;
-
-use FindBin;
-use lib "$FindBin::Bin/../lib";
+use 5.010_001;
 
 use POSIX;
 use Getopt::Long;
@@ -16,11 +14,11 @@ synfloodguard - Protect against SYN-flood attacks
 
 =head1 VERSION
 
-0.01
+0.11
 
 =cut
 
-our $VERSION = 0.01;
+our $VERSION = 0.11;
 
 use constant {              # TCP connection states as defined in the Linux
 	TCP_ESTABLISHED => 1,   #   kernel headers (net/tcp_states.h)
@@ -39,12 +37,14 @@ use constant {              # TCP connection states as defined in the Linux
 
 =head1 SYNOPSIS
 
-synfloodguard [--state=<path>] [--pid=<path>] [--tcp=<path>] [--log=<path>]
-              [--ipset=<path>] [--set=<name>] [--poll=<seconds>]
-              [--flood=<number>] [--timeout=<seconds>] [--synner=<seconds>]
-              [--daemonize] [--quite] [--verbose] [--debug]
+C<synfloodguard> [C<--state=path>]
+[C<--pid=path>] [C<--tcp=path>] [C<--log=path>]
+[C<--ipset=path>] [C<--set=name>] [C<--poll=seconds>]
+[C<--flood=number>] [C<--timeout=seconds>] [C<--synner=seconds>]
+[C<--forget=float-point number>]
+[C<--daemonize>] [C<--quite>] [C<--verbose>] [C<--debug>]
 
-synfloodguard --stop [--pid=<path>]
+C<synfloodguard> C<--stop> [C<--pid=path>]
 
 =cut
 
@@ -391,3 +391,195 @@ while (1)
 
 	sleep $poll_interval;
 }
+
+__END__
+
+=head1 OPTIONS
+
+Options can be placed in arbitrary order. Each one has its default value.
+
+=over
+
+=item C<--daemonize>
+
+Run as a daemon. Disconnect from a terminal and go to background.
+
+Default: no
+
+=item C<--debug>
+
+Be even more verbose.
+
+Default: no
+
+=item C<--flood=number>
+
+How many simultaneous half-open connections from one remote IP address have
+to be detected to consider the remote host as a flooder. This is the main
+protection against DoS attack from one or several hosts.
+
+Default: 10
+
+=item C<--forget=float-point number>
+
+The forget factor used in detection of annoying synners. Sensible values are
+greater than 0, and lesser than 1. Lesser values mean harder policy.
+See L</"ANNOYING SYNNER DETECTION">.
+
+Default: 0.5
+
+=item C<--ipset=path>
+
+Path to the C<ipset> program executable file.
+
+Default: F</usr/sbin/ipset>
+
+=item C<--log=path>
+
+Path to a log file or C<STDERR>. There is no syslog support yet, sorry.
+
+Default: F</var/log/synfloodguard.log>
+
+=item C<--pid=path>
+
+Path to a file where the program’s process identifier is written. This file
+is created when the program starts, and removed when it completes
+successfully. If the program is not running but the file exists then
+something goes wrong.
+
+Default: F</var/local/antidos/synfloodguard-pid>
+
+=item C<--poll=seconds>
+
+How often (in seconds) the program should poll the TCP connection information
+file. This value is rough, the real poll time may differ slightly.
+
+Default: 30
+
+=item C<--quite>
+
+Do not write to log anything excepting errors.
+
+Default: no
+
+=item C<--set=name>
+
+Name of the IP set of type C<iphash> (see L<ipset(8)>). The program adds
+addresses to and removes them from that set.
+
+Default: C<synfloodguard>
+
+=item C<--state=path>
+
+Path to a file where the program state is stored. The state is stored and
+retrieved by the C<Storable> module. It contains two hashes: C<flooders>
+and C<synners>. Their keys are IP addresses of remote hosts. Values in the
+C<flooders> hash are timestamps indicating when the corresponding IP addresses
+were blacklisted. Values in the C<synners> hash are “weights”, the measure
+of the host annoyance. See L</"ANNOYING SYNNER DETECTION">.
+
+Default: F</var/local/antidos/synfloodguard-state>
+
+=item C<--stop>
+
+Stop running program found by its process identifier in the pid-file.
+
+Default: no
+
+=item C<--synner=seconds>
+
+How long a remote host is allowed to make half-open connections (to send SYNs
+and not to respond to SYN_ACKs) continually. If a host exceeds this time,
+the program considers it as a flooder (“annoying synner”).
+See L</"ANNOYING SYNNER DETECTION">.
+
+Default: 900 (15 minutes)
+
+=item C<--tcp=path>
+
+Path to a file containing information about current TCP connections.
+See the Linux kernel documentation (F<networking/proc_net_tcp.txt>)
+for the file format.
+
+Default: F</proc/net/tcp> (you should not change it usually)
+
+=item C<--timeout=seconds>
+
+The remote IP-addresses detected to be flooders are added to IP set
+(blacklisted) for this time (in seconds). After that they are removed from
+IP set.
+
+Default: 3600 (1 hour)
+
+=item C<--verbose>
+
+Be verbose, write to log more details.
+
+Default: no
+
+=back
+
+=head1 DESCRIPTION
+
+The program reads F</proc/net/tcp> periodically searching the half-opened
+connections (C<SYN_RECV>). If there are too many such connections from
+some IP address, that address is blacklisted for some time. Blacklisting
+is done by running the F<ipset> command. You need to create the IP set and
+configure your firewall to use it. For example:
+
+	# ipset -N synfloodguard iphash
+	# iptables -I INPUT 1 -m set --match-set synfloodguard src -j DROP
+
+=head1 ANNOYING SYNNER DETECTION
+
+As the program detects a half-open connection (C<SYN_RECV> state), it remembers
+the remote IP address in the C<synners> hash item. The item key is IP address
+and the value is its I<weight>. The weight is increased by some value (called
+I<quantum>, see below) if C<SYN_RECV> is detected at next poll. Otherwise it is
+decreased by the same value multiplied by the I<forget factor>.
+
+The I<quantum> is calculated as the number of poll intervals (C<--poll>
+option) in the maximal allowed synner time (C<--synner> option). If a remote
+host keeps on sending dummy SYNs, its synner weight increases at each poll and
+reaches the value of 1 shortly after maximal synner time.
+
+If the remote host stops sending SYNs, its synner weight decreases at each
+poll by the quantum multiplied by the forget factor. This factor is >0 and <1
+usually. So the weight goes down and when it reaches 0, the program forgets
+about that IP address.
+
+Remote host having synner weight greater than 1 are considered as annoying
+synners and blacklisted in the such way as flooders.
+
+=head1 SIGNALS
+
+=over
+
+=item HUP
+
+Reopen log file.
+
+=item USR1
+
+Temporarily switch debugging on (if there is no --debug option)
+or off (otherwise).
+
+=item USR2
+
+Dump the program state to log.
+
+=back
+
+=head1 TODO
+
+=over
+
+=item *
+
+Syslog support
+
+=back
+
+=head1 AUTHOR
+
+Alexander Lebedev <mevedech@yandex.ru>
