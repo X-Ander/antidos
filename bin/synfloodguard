@@ -313,13 +313,13 @@ while (1)
 
 			#log_debug "'$_'";
 
-			my ($our_ip, $our_port, $ip, $port, $state) =
+			my ($our_ip, $our_port, $ip, $port, $st) =
 				(hex $1, hex $2, hex $3, hex $4, hex $5);
 
 			my $our_ip_s = ip2s($our_ip);
 			my $ip_s = ip2s($ip);
 
-			if ($state == TCP_SYN_RECV) {
+			if ($st == TCP_SYN_RECV) {
 				log_verbose
 					"Found SYN_RECV: $ip_s:$port -> $our_ip_s:$our_port";
 				$cnt{$ip}++;
