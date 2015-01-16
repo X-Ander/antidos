@@ -235,7 +235,8 @@ $SIG{USR1} = \&toggle_debug;
 $SIG{USR2} = \&log_dump;
 
 sub execute {
-	my $ret = 0;
+	my $expected_statuses = ref($_[0]) eq 'ARRAY' ? shift : [0];
+	my $exit_status = -1;
 	my $cmd = join(' ', @_);
 	log_debug "Run: $cmd";
 	system @_;
@@ -245,15 +246,14 @@ sub execute {
 		log_error "[$cmd] died with signal ", ($? & 127), ", ",
 			(($? & 128) ? 'with' : 'without'), " coredump";
 	} else {
-		my $exit_status = $? >> 8;
-		if ($exit_status != 0) {
-			log_error "[$cmd] exited with status $exit_status";
+		$exit_status = $? >> 8;
+		if (grep {$_ == $exit_status} @$expected_statuses) {
+			log_debug "[$cmd] exited normally with status $exit_status";
 		} else {
-			log_debug "[$cmd] exited normally";
-			$ret = 1;
+			log_error "[$cmd] exited abnormally with status $exit_status";
 		}
 	}
-	return $ret;
+	return $exit_status;
 }
 
 close STDIN;
@@ -328,7 +328,7 @@ while (1)
 					log_info "Flooder detected: $ip_s";
 
 					unless (exists $state->{flooders}{$ip}) {
-						if (execute($ipset_cmd, '-A', $set, $ip_s)) {
+						if (execute($ipset_cmd, '-A', $set, $ip_s) == 0) {
 							log_info "$ip_s added to ipset";
 						}
 					}
@@ -355,7 +355,7 @@ while (1)
 
 				if (exists $state->{flooders}{$ip}) {
 					$state->{flooders}{$ip} = $now;
-				} elsif (execute $ipset_cmd, '-A', $set, $ip_s) {
+				} elsif (execute($ipset_cmd, '-A', $set, $ip_s) == 0) {
 					$state->{flooders}{$ip} = $now;
 					log_info "$ip_s added to ipset";
 				}
@@ -364,8 +364,15 @@ while (1)
 
 		while (my ($ip, $last_time) = each %{$state->{flooders}}) {
 			if ($now - $last_time > $flood_ban_timeout) {
-				if (execute($ipset_cmd, '-D', $set, ip2s($ip))) {
-					log_info ip2s($ip), " removed from ipset";
+				my $test_status = execute([0, 1], $ipset_cmd, '-T', $set, ip2s($ip));
+				if ($test_status == 0) {
+					log_debug ip2s($ip), " is in ipset";
+					if (execute($ipset_cmd, '-D', $set, ip2s($ip)) == 0) {
+						log_info ip2s($ip), " removed from ipset";
+						delete $state->{flooders}->{$ip};
+					}
+				} elsif ($test_status == 1) {
+					log_debug ip2s($ip), " is not in ipset (removed by somebody?)";
 					delete $state->{flooders}->{$ip};
 				}
 			}
